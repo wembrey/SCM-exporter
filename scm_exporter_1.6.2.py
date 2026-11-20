@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only Strata Cloud Manager auto-discovery and evidence exporter."""
 from __future__ import annotations
-import argparse, csv, hashlib, json, logging, os, re, time, shutil, zipfile
+import argparse, csv, hashlib, json, logging, os, re, sys, time, shutil, zipfile
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +11,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-VERSION = "1.5.0"
+VERSION = "1.6.2"
 AUTH_URL = "https://auth.apps.paloaltonetworks.com/oauth2/access_token"
 API_BASE = "https://api.strata.paloaltonetworks.com"
 DISCOVERY = {
@@ -27,7 +27,7 @@ ENDPOINTS = {
     "application-filters":"/config/objects/v1/application-filters", "schedules":"/config/objects/v1/schedules",
     "external-dynamic-lists":"/config/objects/v1/external-dynamic-lists",
     "security-rules":"/config/security/v1/security-rules", "nat-rules":"/config/network/v1/nat-rules",
-    "decryption-rules":"/config/decryption/v1/decryption-rules",
+    "decryption-rules":"/config/security/v1/decryption-rules",
     "authentication-rules":"/config/security/v1/authentication-rules",
     "antivirus-profiles":"/config/security/v1/anti-virus-profiles",
     "anti-spyware-profiles":"/config/security/v1/anti-spyware-profiles",
@@ -37,12 +37,14 @@ ENDPOINTS = {
     "wildfire-profiles":"/config/security/v1/wildfire-anti-virus-profiles",
     "dns-security-profiles":"/config/security/v1/dns-security-profiles",
     "profile-groups":"/config/security/v1/profile-groups",
-    "log-forwarding-profiles":"/config/logging/v1/log-forwarding-profiles",
+    "log-forwarding-profiles":"/config/objects/v1/log-forwarding-profiles",
     "zones":"/config/network/v1/zones", "ethernet-interfaces":"/config/network/v1/ethernet-interfaces",
     "aggregate-interfaces":"/config/network/v1/aggregate-interfaces",
     "loopback-interfaces":"/config/network/v1/loopback-interfaces",
     "tunnel-interfaces":"/config/network/v1/tunnel-interfaces", "vlan-interfaces":"/config/network/v1/vlan-interfaces",
-    "virtual-routers":"/config/network/v1/virtual-routers", "static-routes":"/config/network/v1/static-routes",
+    "virtual-routers":"/config/network/v1/virtual-routers",
+    "logical-routers":"/config/network/v1/logical-routers",
+    "static-routes":"/config/network/v1/static-routes",
     "ipsec-tunnels":"/config/network/v1/ipsec-tunnels", "ike-gateways":"/config/network/v1/ike-gateways",
     "ike-crypto-profiles":"/config/network/v1/ike-crypto-profiles",
     "ipsec-crypto-profiles":"/config/network/v1/ipsec-crypto-profiles",
@@ -50,7 +52,6 @@ ENDPOINTS = {
     "system-settings":"/config/device/v1/system-settings", "administrators":"/config/device/v1/administrators",
     "authentication-profiles":"/config/identity/v1/authentication-profiles",
     "certificates":"/config/device/v1/certificates",
-    "ha-devices":"/config/device/v1/ha-devices",
     "ha-configurations":"/config/device/v1/ha-configurations",
 }
 PRUNED_ENDPOINTS = {
@@ -61,6 +62,8 @@ PRUNED_ENDPOINTS = {
     "application-filters": "Potentially large; include when the LLD explicitly validates application filters",
     "schedules": "Usually low-value for baseline build validation unless policy schedules are in scope",
     "external-dynamic-lists": "Optional; include when EDLs are part of the LLD",
+    "static-routes": "Legacy standalone endpoint; Advanced Routing static routes are collected inside logical-routers",
+    "ha-devices": "Invalid for this NGFW context; HA evidence is collected from ha-configurations",
 }
 
 AUTO_ENDPOINTS = [
@@ -70,7 +73,7 @@ AUTO_ENDPOINTS = [
     "security-rules", "nat-rules", "decryption-rules",
     # Network / routing / VPN
     "zones", "ethernet-interfaces", "aggregate-interfaces", "loopback-interfaces",
-    "tunnel-interfaces", "vlan-interfaces", "virtual-routers", "static-routes",
+    "tunnel-interfaces", "vlan-interfaces", "virtual-routers", "logical-routers",
     "ipsec-tunnels", "ike-gateways", "ike-crypto-profiles", "ipsec-crypto-profiles",
     # Security / logging
     "antivirus-profiles", "anti-spyware-profiles", "vulnerability-protection-profiles",
@@ -79,8 +82,67 @@ AUTO_ENDPOINTS = [
     # Device / identity settings useful for build validation
     "dns-settings", "ntp-settings", "system-settings", "authentication-profiles", "certificates",
     # HA inventory/configuration
-    "ha-devices", "ha-configurations",
+    "ha-configurations",
 ]
+
+# Endpoint behaviour for the NGFW-only evidence model.
+# Any endpoint not listed here can be queried in folder, snippet or device context.
+ENDPOINT_SCOPE_TYPES = {
+    "logical-routers": {"device"},
+    "ha-configurations": {"device"},
+}
+ENDPOINT_RESPONSE_TYPES = {
+    "ha-configurations": "singleton",
+}
+
+ENDPOINT_VARIANTS = {
+    # SCM requires position for decryption rule listing.
+    "decryption-rules": [
+        ("pre", {"position": "pre"}),
+        ("post", {"position": "post"}),
+    ],
+}
+SASE_SCOPE = re.compile(
+    r"(prisma|mobile[- ]?users?|remote[- ]?networks?|service[- ]?connections?|explicit[- ]?proxy|sase)",
+    re.I,
+)
+
+def endpoint_supports_scope(endpoint:str, scope_type:str) -> bool:
+    return scope_type in ENDPOINT_SCOPE_TYPES.get(endpoint, {"folder", "snippet", "device"})
+
+def ngfw_scopes_only(scopes:List[Dict[str,str]], include_system:bool=False) -> List[Dict[str,str]]:
+    """Drop Prisma Access/SASE scopes recursively and folder entries that are device IDs."""
+    by_id={str(x.get("id","")):x for x in scopes if x.get("id")}
+    by_name={str(x.get("scope_name","")):x for x in scopes if x.get("scope_name")}
+    device_tokens={str(x.get("id","")) for x in scopes if x.get("scope_type")=="device"}
+    device_tokens.update(str(x.get("scope_name","")) for x in scopes if x.get("scope_type")=="device")
+
+    def is_sase(scope):
+        seen=set(); current=scope
+        while current:
+            key=str(current.get("id") or current.get("scope_name") or id(current))
+            if key in seen: break
+            seen.add(key)
+            if SASE_SCOPE.search(str(current.get("scope_name",""))): return True
+            parent=str(current.get("parent","") or "")
+            current=by_id.get(parent) or by_name.get(parent)
+        return False
+
+    selected=[]
+    for x in scopes:
+        st=x.get("scope_type",""); name=str(x.get("scope_name",""))
+        if is_sase(x): continue
+        if st=="folder" and (name in device_tokens or re.fullmatch(r"\d{12,}",name)): continue
+        if st=="snippet" and not include_system and SYSTEM_SNIPPET.search(name): continue
+        selected.append(x)
+    return selected
+
+def scope_params(scope:Dict[str,str]) -> Dict[str,str]:
+    """Use the numeric SCM device ID where available; names remain for folders/snippets."""
+    st=scope["scope_type"]
+    if st=="device":
+        return {"device": scope.get("id") or scope["scope_name"]}
+    return {st: scope["scope_name"]}
 
 SYSTEM_SNIPPET = re.compile(r"^(predefined-snippet|default|optional-default|office365|proxy|rbi|saas-tenant-restrictions|Auto-VPN-|ZTP-|Internet-Access-|Web-Security-|Gen-AI-|app-tagging|hip-default|dlp-predefined|SAAS-Inline-|DNS-Best-|GlobalProtect-|AIRS-|GCP-VM-|Azure-VM-|AWS-VM-|vm-hsf-)", re.I)
 SENSITIVE = re.compile(r"(password|passwd|secret|private[_-]?key|authorization|token)$", re.I)
@@ -131,6 +193,17 @@ def records(payload:Any):
         if set(payload).issubset({"total","count","limit","offset","next","next_page","nextPageToken"}): return []
         return [payload]
     return [{"value":payload}]
+def application_error(payload:Any) -> Optional[str]:
+    if not isinstance(payload,dict): return None
+    embedded=payload.get("httpStatusCode")
+    bad_status=isinstance(embedded,(int,float)) and embedded >= 400
+    if payload.get("ok") is False or payload.get("errorCode") or bad_status:
+        parts=[str(payload.get(k)) for k in ("errorCode","errorMessage","httpStatusCode") if payload.get(k) is not None]
+        extra=payload.get("extra")
+        if extra: parts.append(json.dumps(extra,ensure_ascii=False))
+        return "Application error: " + " | ".join(parts)
+    return None
+
 def error_text(r):
     try: b=r.json()
     except ValueError: return r.text[:2000] or r.reason
@@ -157,20 +230,26 @@ def write_rows(path:Path, rs:List[Dict[str,Any]], endpoint:str, scope:Dict[str,s
     fields=base+[x for x in fields if x not in base]
     with path.open("w",newline="",encoding="utf-8-sig") as f:
         w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
-def export(client,name,path,scope,raw_dir,csv_dir,limit,max_pages):
+def export(client,name,path,scope,raw_dir,csv_dir,limit,max_pages,extra_params=None,endpoint_name=None):
     st=next(iter(scope),"tenant"); sn=str(scope.get(st,"all")); allr=[]; pages=[]; offset=0; status=None
     try:
         for _ in range(max_pages):
-            r=client.get(path,{**scope,"limit":limit,"offset":offset}); status=r.status_code
+            r=client.get(path,{**scope,**(extra_params or {}),"limit":limit,"offset":offset}); status=r.status_code
             if status in (403,404): return Result(name,path,st,sn,"skipped",status,0,len(pages),error=f"HTTP {status}: {error_text(r)}")
             if status>=400: raise RuntimeError(f"HTTP {status}: {error_text(r)}")
-            body=redact(r.json()); batch=records(body); allr.extend(batch); pages.append(body)
+            body=redact(r.json())
+            app_error=application_error(body)
+            if app_error: raise RuntimeError(app_error)
+            response_type=ENDPOINT_RESPONSE_TYPES.get(endpoint_name or "", "list")
+            batch=[body] if response_type=="singleton" and isinstance(body,dict) else records(body)
+            allr.extend(batch); pages.append(body)
+            if response_type=="singleton": break
             total=body.get("total") if isinstance(body,dict) else None
             if not isinstance(total,int) or offset+len(batch)>=total or not batch: break
             offset+=len(batch)
         else: raise RuntimeError(f"Pagination exceeded max_pages={max_pages}")
         rp=raw_dir/(safe(name)+".json"); cp=csv_dir/(safe(name)+".csv")
-        doc={"endpoint":name,"api_path":path,"scope":scope,"exported_at_utc":datetime.now(timezone.utc).isoformat(),"record_count":len(allr),"pages":pages}
+        doc={"endpoint":name,"api_path":path,"scope":scope,"query_parameters":extra_params or {},"exported_at_utc":datetime.now(timezone.utc).isoformat(),"record_count":len(allr),"pages":pages}
         text=json.dumps(doc,indent=2,ensure_ascii=False); rp.write_text(text,encoding="utf-8"); write_rows(cp,allr,name,scope)
         return Result(name,path,st,sn,"success",status,len(allr),len(pages),str(rp),str(cp),hashlib.sha256(text.encode()).hexdigest())
     except requests.Timeout as e:
@@ -284,6 +363,52 @@ def build_workbook(path:Path, manifest:Dict[str,Any], scopes:List[Dict[str,str]]
     for row in result_rows:
         for k in row:
             if k not in result_headers: result_headers.append(k)
+    # Derive human-readable Advanced Routing evidence from logical-router raw responses.
+    lr_rows=[]; vrf_rows=[]; route_rows=[]
+    for r in results:
+        if r.status!="success" or not r.raw_file or "logical-routers" not in r.name: continue
+        try:
+            doc=json.loads(Path(r.raw_file).read_text(encoding="utf-8"))
+            for page in doc.get("pages",[]):
+                routers=records(page)
+                for lr in routers:
+                    lr_rows.append({"device":r.scope_name,"name":lr.get("name"),"folder":lr.get("folder"),"id":lr.get("id")})
+                    for vrf in lr.get("vrf",[]) or []:
+                        ecmp=vrf.get("ecmp",{}) or {}
+                        vrf_rows.append({"device":r.scope_name,"logical_router":lr.get("name"),"vrf":vrf.get("name"),
+                          "interfaces":json.dumps(vrf.get("interface",[]),ensure_ascii=False),"ecmp_enabled":ecmp.get("enable"),
+                          "ecmp_max_path":ecmp.get("max_path"),"symmetric_return":ecmp.get("symmetric_return"),
+                          "admin_distances":json.dumps(vrf.get("admin_dists",{}),ensure_ascii=False)})
+                        routes=(((vrf.get("routing_table") or {}).get("ip") or {}).get("static_route") or [])
+                        for route in routes:
+                            nh=route.get("nexthop",{}) or {}; pm=route.get("path_monitor",{}) or {}; bfd=route.get("bfd",{}) or {}
+                            route_rows.append({"device":r.scope_name,"logical_router":lr.get("name"),"vrf":vrf.get("name"),
+                              "name":route.get("name"),"destination":route.get("destination"),"interface":route.get("interface"),
+                              "next_hop":nh.get("ip_address"),"metric":route.get("metric"),"bfd_profile":bfd.get("profile"),
+                              "path_monitor_enabled":pm.get("enable")})
+        except (OSError,ValueError,TypeError):
+            pass
+    if lr_rows: sheets.append(("Logical Routers",["device","name","folder","id"],lr_rows))
+    if vrf_rows: sheets.append(("Logical Router VRFs",["device","logical_router","vrf","interfaces","ecmp_enabled","ecmp_max_path","symmetric_return","admin_distances"],vrf_rows))
+    if route_rows: sheets.append(("Logical Router Routes",["device","logical_router","vrf","name","destination","interface","next_hop","metric","bfd_profile","path_monitor_enabled"],route_rows))
+
+    coverage_defs=[
+      ("HA configuration","ha-configurations","Yes"),("Advanced routing","logical-routers","Yes"),
+      ("Legacy virtual routing","virtual-routers","No"),("DNS settings","dns-settings","Yes"),
+      ("NTP settings","ntp-settings","Yes"),("System settings","system-settings","Yes"),
+      ("Certificates","certificates","Yes")]
+    coverage=[]
+    for family,ep,required in coverage_defs:
+        rr=[x for x in results if (x.name.endswith("-"+ep) or ("-"+ep+"-") in x.name)]
+        ok=[x for x in rr if x.status=="success"]
+        count=sum(x.records for x in ok)
+        if not rr: state="NOT ATTEMPTED"
+        elif len(ok)==len(rr) and count>0: state="COVERED"
+        elif len(ok)==len(rr) and count==0: state="NOT CONFIGURED"
+        else: state="GAP"
+        coverage.append({"configuration_family":family,"endpoint":ep,"required":required,"queries":len(rr),"successful_queries":len(ok),"records":count,"status":state})
+    sheets.append(("Coverage",["configuration_family","endpoint","required","queries","successful_queries","records","status"],coverage))
+
     sheets.append(("API Results",result_headers,result_rows))
     for ep in endpoints:
         rows=grouped.get(ep,[]); headers=[]
@@ -342,8 +467,8 @@ def choose_endpoints_interactively(defaults:List[str]) -> List[str]:
 
 
 def main():
-    ap=argparse.ArgumentParser(description="SCM read-only discovery and full evidence exporter")
-    ap.add_argument("--output",default="./scm-export"); ap.add_argument("--discover",action="store_true")
+    ap=argparse.ArgumentParser(description="SCM read-only NGFW discovery and evidence exporter")
+    ap.add_argument("--output",default="./export"); ap.add_argument("--discover",action="store_true")
     ap.add_argument("--auto-export",action="store_true"); ap.add_argument("--include-system-scopes",action="store_true")
     ap.add_argument("--scope-regex"); ap.add_argument("--scope-type",action="append",choices=("folder","snippet","device"))
     ap.add_argument("--endpoint",action="append",dest="endpoints")
@@ -355,7 +480,29 @@ def main():
     ap.add_argument("--request-timeout",type=int,default=20,help="Per SCM GET timeout in seconds (default: 20)")
     ap.add_argument("--delay",type=float,default=0.10,help="Delay between GET requests in seconds (default: 0.10)")
     ap.add_argument("--insecure",action="store_true"); ap.add_argument("--verbose",action="store_true")
-    a=ap.parse_args(); logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
+    no_options=len(sys.argv)==1
+    if no_options:
+        print(f"SCM Evidence Exporter v{VERSION}")
+        print("No command-line options were specified.\n")
+        print("  [1] Auto-export NGFW evidence to ./export (default)")
+        print("  [2] Show command-line options")
+        print("  [3] Exit")
+        try:
+            answer=input("\nSelect [1]: ").strip() or "1"
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return 130
+        if answer=="2":
+            ap.print_help(); return 0
+        if answer=="3":
+            return 0
+        if answer!="1":
+            print("Unknown selection; exiting.")
+            return 2
+        a=ap.parse_args(["--auto-export", "--output", "./export"])
+    else:
+        a=ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
     if a.list_endpoints:
         for n,p in sorted(ENDPOINTS.items()): print(f"{n:40} {p}")
         return 0
@@ -379,20 +526,30 @@ def main():
     logging.info("Discovering tenant folders, snippets and devices")
     results,scopes=discover(c,raw,csvd,a.page_size,a.max_pages)
     write_dicts(root/"discovered-scopes.csv",scopes,["scope_type","scope_name","id","parent"])
-    chosen=list(scopes)
-    if not a.include_system_scopes: chosen=[x for x in chosen if not (x["scope_type"]=="snippet" and SYSTEM_SNIPPET.search(x["scope_name"]))]
+    chosen=ngfw_scopes_only(scopes, include_system=a.include_system_scopes)
     if a.scope_regex:
         rx=re.compile(a.scope_regex,re.I); chosen=[x for x in chosen if rx.search(x["scope_name"])]
     if a.scope_type: chosen=[x for x in chosen if x["scope_type"] in set(a.scope_type)]
     write_dicts(root/"selected-scopes.csv",chosen,["scope_type","scope_name","id","parent"])
     for x in scopes: print(f"{x['scope_type']:8} {x['scope_name']}")
     if a.auto_export:
-        jobs=[(x,n) for x in chosen for n in selected]; total=len(jobs)
-        for i,(x,n) in enumerate(jobs,1):
-            scope={x["scope_type"]:x["scope_name"]}; job=f"{x['scope_type']}-{safe(x['scope_name'])}-{n}"
-            logging.info("[%d/%d] %s",i,total,job); r=export(c,job,ENDPOINTS[n],scope,raw,csvd,a.page_size,a.max_pages); results.append(r)
+        jobs=[]
+        for x in chosen:
+            for n in selected:
+                if not endpoint_supports_scope(n, x["scope_type"]):
+                    continue
+                for suffix, extra in ENDPOINT_VARIANTS.get(n, [("", {})]):
+                    jobs.append((x,n,suffix,extra))
+        total=len(jobs)
+        for i,(x,n,suffix,extra) in enumerate(jobs,1):
+            scope=scope_params(x)
+            variant=f"-{suffix}" if suffix else ""
+            job=f"{x['scope_type']}-{safe(x['scope_name'])}-{n}{variant}"
+            logging.info("[%d/%d] %s",i,total,job)
+            r=export(c,job,ENDPOINTS[n],scope,raw,csvd,a.page_size,a.max_pages,extra_params=extra,endpoint_name=n)
+            results.append(r)
             logging.info("%s: %s (%d records)",job,r.status,r.records)
-    manifest={"exporter_version":VERSION,"exported_at_utc":datetime.now(timezone.utc).isoformat(),"api_base":API_BASE,"tsg_id":creds[2],"read_only":True,"discovered_scopes":scopes,"selected_scopes":chosen,"selected_endpoints":selected,"pruned_endpoints":PRUNED_ENDPOINTS,"results":[asdict(x) for x in results]}
+    manifest={"exporter_version":VERSION,"exported_at_utc":datetime.now(timezone.utc).isoformat(),"api_base":API_BASE,"tsg_id":creds[2],"read_only":True,"project_scope":"NGFW only; Prisma Access/SASE excluded","discovered_scopes":scopes,"selected_scopes":chosen,"selected_endpoints":selected,"pruned_endpoints":PRUNED_ENDPOINTS,"results":[asdict(x) for x in results]}
     manifest["summary"]={"success":sum(x.status=="success" for x in results),"skipped":sum(x.status=="skipped" for x in results),"timeout":sum(x.status=="timeout" for x in results),"failed":sum(x.status=="failed" for x in results),"records":sum(x.records for x in results),"discovered_scopes":len(scopes),"selected_scopes":len(chosen)}
     final_path=Path(a.output).expanduser().resolve()/f"SCM_Evidence_{root.name}.xlsx"
     build_workbook(final_path,manifest,scopes,chosen,results,selected)
