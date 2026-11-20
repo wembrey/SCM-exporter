@@ -11,7 +11,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 AUTH_URL = "https://auth.apps.paloaltonetworks.com/oauth2/access_token"
 API_BASE = "https://api.strata.paloaltonetworks.com"
 DISCOVERY = {
@@ -81,6 +81,66 @@ AUTO_ENDPOINTS = [
     # HA inventory/configuration
     "ha-devices", "ha-configurations",
 ]
+
+CRITICAL_ENDPOINTS = {
+    "security-rules", "nat-rules", "zones", "ethernet-interfaces",
+    "aggregate-interfaces", "loopback-interfaces", "tunnel-interfaces",
+    "vlan-interfaces", "virtual-routers", "static-routes",
+    "ipsec-tunnels", "ike-gateways", "ha-devices", "ha-configurations",
+}
+IMPORTANT_ENDPOINTS = {
+    "addresses", "address-groups", "services", "service-groups",
+    "profile-groups", "log-forwarding-profiles", "authentication-profiles",
+}
+
+def resource_name(result_name:str, endpoints:List[str]) -> str:
+    return next((ep for ep in sorted(endpoints,key=len,reverse=True) if result_name.endswith("-"+ep)), result_name)
+
+def severity_for(resource:str, status:str) -> str:
+    if status == "success": return "OK"
+    if resource in CRITICAL_ENDPOINTS: return "CRITICAL"
+    if resource in IMPORTANT_ENDPOINTS: return "IMPORTANT"
+    return "OPTIONAL"
+
+def failure_summary(results:List[Result], endpoints:List[str]):
+    issues=[]
+    empty=0
+    for r in results:
+        resource=resource_name(r.name,endpoints)
+        if r.status=="success" and r.records==0:
+            empty+=1
+        if r.status!="success":
+            issues.append({
+                "severity":severity_for(resource,r.status), "resource":resource,
+                "scope_type":r.scope_type, "scope_name":r.scope_name,
+                "status":r.status, "http_status":"" if r.http_status is None else r.http_status,
+                "records":r.records, "error":r.error or "",
+            })
+    order={"CRITICAL":0,"IMPORTANT":1,"OPTIONAL":2}
+    issues.sort(key=lambda x:(order.get(x["severity"],9),x["resource"],x["scope_name"]))
+    return issues,empty
+
+def print_failure_summary(manifest:Dict[str,Any], issues:List[Dict[str,Any]], workbook:Path) -> None:
+    sm=manifest["summary"]
+    print("\n"+"="*72)
+    print("SCM EVIDENCE EXPORT COMPLETE")
+    print("="*72)
+    print(f"Scopes: discovered {sm['discovered_scopes']}, included {sm['selected_scopes']}, excluded {sm['discovered_scopes']-sm['selected_scopes']}")
+    print(f"API queries: success {sm['success']}, empty {sm['empty']}, skipped {sm['skipped']}, timeout {sm['timeout']}, failed {sm['failed']}")
+    print(f"Configuration records collected: {sm['records']}")
+    critical=sum(x["severity"]=="CRITICAL" for x in issues); important=sum(x["severity"]=="IMPORTANT" for x in issues)
+    if issues:
+        print("\nCOLLECTION ISSUES")
+        print("-"*72)
+        for x in issues:
+            http=f" HTTP {x['http_status']}" if x['http_status']!="" else ""
+            print(f"[{x['severity']}] {x['resource']} | {x['scope_type']} / {x['scope_name']} | {x['status']}{http}")
+            if x["error"]: print(f"           {str(x['error'])[:180]}")
+    else:
+        print("\nNo collection failures, timeouts or skipped queries.")
+    print("\nEvidence completeness: "+("INCOMPLETE - important evidence was missed" if (critical or important) else "COMPLETE for selected endpoint set"))
+    print(f"Workbook: {workbook}")
+    print("="*72)
 
 SYSTEM_SNIPPET = re.compile(r"^(predefined-snippet|default|optional-default|office365|proxy|rbi|saas-tenant-restrictions|Auto-VPN-|ZTP-|Internet-Access-|Web-Security-|Gen-AI-|app-tagging|hip-default|dlp-predefined|SAAS-Inline-|DNS-Best-|GlobalProtect-|AIRS-|GCP-VM-|Azure-VM-|AWS-VM-|vm-hsf-)", re.I)
 SENSITIVE = re.compile(r"(password|passwd|secret|private[_-]?key|authorization|token)$", re.I)
@@ -257,9 +317,13 @@ def build_workbook(path:Path, manifest:Dict[str,Any], scopes:List[Dict[str,str]]
       {"Property":"Exported UTC","Value":manifest["exported_at_utc"]},
       {"Property":"TSG ID","Value":manifest["tsg_id"]},
       {"Property":"Successful queries","Value":summary["success"]},
+      {"Property":"Successful empty queries","Value":summary.get("empty",0)},
       {"Property":"Skipped queries","Value":summary["skipped"]},
       {"Property":"Timed-out queries","Value":summary["timeout"]},
       {"Property":"Failed queries","Value":summary["failed"]},
+      {"Property":"Critical collection issues","Value":summary.get("critical_issues",0)},
+      {"Property":"Important collection issues","Value":summary.get("important_issues",0)},
+      {"Property":"Optional collection issues","Value":summary.get("optional_issues",0)},
       {"Property":"Configuration records","Value":summary["records"]},
       {"Property":"Discovered scopes","Value":summary["discovered_scopes"]},
       {"Property":"Selected scopes","Value":summary["selected_scopes"]},
@@ -275,8 +339,8 @@ def build_workbook(path:Path, manifest:Dict[str,Any], scopes:List[Dict[str,str]]
     result_rows=[]
     grouped={ep:[] for ep in endpoints}
     for r in results:
-        resource=next((ep for ep in sorted(endpoints,key=len,reverse=True) if r.name.endswith("-"+ep)), r.name)
-        result_rows.append({"resource":resource,**asdict(r)})
+        resource=resource_name(r.name,endpoints)
+        result_rows.append({"severity":severity_for(resource,r.status),"resource":resource,**asdict(r)})
         if r.status=="success" and r.csv_file and resource in grouped:
             with open(r.csv_file,newline="",encoding="utf-8-sig") as f:
                 grouped[resource].extend(dict(x) for x in csv.DictReader(f))
@@ -285,6 +349,9 @@ def build_workbook(path:Path, manifest:Dict[str,Any], scopes:List[Dict[str,str]]
         for k in row:
             if k not in result_headers: result_headers.append(k)
     sheets.append(("API Results",result_headers,result_rows))
+    issue_rows=[row for row in result_rows if row.get("status") != "success"]
+    issue_headers=["severity","resource","scope_type","scope_name","status","http_status","records","error"]
+    sheets.append(("Collection Issues",issue_headers,issue_rows))
     for ep in endpoints:
         rows=grouped.get(ep,[]); headers=[]
         for row in rows:
@@ -393,10 +460,12 @@ def main():
             logging.info("[%d/%d] %s",i,total,job); r=export(c,job,ENDPOINTS[n],scope,raw,csvd,a.page_size,a.max_pages); results.append(r)
             logging.info("%s: %s (%d records)",job,r.status,r.records)
     manifest={"exporter_version":VERSION,"exported_at_utc":datetime.now(timezone.utc).isoformat(),"api_base":API_BASE,"tsg_id":creds[2],"read_only":True,"discovered_scopes":scopes,"selected_scopes":chosen,"selected_endpoints":selected,"pruned_endpoints":PRUNED_ENDPOINTS,"results":[asdict(x) for x in results]}
-    manifest["summary"]={"success":sum(x.status=="success" for x in results),"skipped":sum(x.status=="skipped" for x in results),"timeout":sum(x.status=="timeout" for x in results),"failed":sum(x.status=="failed" for x in results),"records":sum(x.records for x in results),"discovered_scopes":len(scopes),"selected_scopes":len(chosen)}
+    issues,empty_count=failure_summary(results,selected)
+    manifest["summary"]={"success":sum(x.status=="success" for x in results),"empty":empty_count,"skipped":sum(x.status=="skipped" for x in results),"timeout":sum(x.status=="timeout" for x in results),"failed":sum(x.status=="failed" for x in results),"records":sum(x.records for x in results),"discovered_scopes":len(scopes),"selected_scopes":len(chosen),"critical_issues":sum(x["severity"]=="CRITICAL" for x in issues),"important_issues":sum(x["severity"]=="IMPORTANT" for x in issues),"optional_issues":sum(x["severity"]=="OPTIONAL" for x in issues)}
+    manifest["collection_issues"]=issues
     final_path=Path(a.output).expanduser().resolve()/f"SCM_Evidence_{root.name}.xlsx"
     build_workbook(final_path,manifest,scopes,chosen,results,selected)
     shutil.rmtree(root)
-    print(json.dumps(manifest["summary"],indent=2)); print("Workbook written to:",final_path)
+    print_failure_summary(manifest,issues,final_path)
     return 1 if (manifest["summary"]["failed"] or manifest["summary"]["timeout"]) else 0
 if __name__=="__main__": raise SystemExit(main())
